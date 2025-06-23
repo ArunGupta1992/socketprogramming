@@ -1,0 +1,11 @@
++--------+                                   +---------+
+| Client |                                   | Server  |
++--------+                                   +---------+
+    |                                              |
+    | socket()                                     | socket()
+    | connect() ------------------------------->   | bind(), listen()
+    |                                              | accept()
+    | send()/write() -------------------------->   | recv()/read()
+    | recv()/read() <--------------------------    | send()/write()
+    |                                              |
+    | close()                                      | close()
