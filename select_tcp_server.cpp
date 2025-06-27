@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <mutex>
+#include <unordered_map>
 
 
 using namespace std;
@@ -43,17 +45,39 @@ using namespace std;
 
 */
 
+/* Strategy Pattern Structure
+  +-----------------+        uses         +------------------------+
+  |   TcpServer     |-------------------> |   IClientHandler       |
+  +-----------------+                     +------------------------+
+  | run(), accept() |                     | on_connect()           |
+  | select(), etc.  |                     | on_data()              |
+  +-----------------+                     | on_disconnect()        |
+                                          +------------------------+
+                                                    ▲
+                                                    |
+                                          +----------------------+
+                                          |   EchoClientHandler  |
+                                          +----------------------+
+
+*/
+
+// CLient Handler interface.
+class IClientHandler
+{
+  public:
+    virtual ~IClientHandler() = default;
+    virtual void on_client_data(
+      int client_fd, const char* data, ssize_t len) = 0;
+    virtual void on_client_connect(int client_fd) = 0;
+    virtual void on_client_disconnect(int client_fd) = 0;
+};
+
 class TcpServer
 {
   public:
-    explicit TcpServer(int port);
-    virtual ~TcpServer();
+    TcpServer(int port, IClientHandler* handler);
+    ~TcpServer();
     void run();
-
-  protected:
-    virtual void on_client_data(int client_fd, const char* data, ssize_t len);
-    virtual void on_client_connect(int client_fd);
-    virtual void on_client_disconnect(int client_fd);
 
   private:
     int server_fd;
@@ -61,6 +85,7 @@ class TcpServer
     int port;
     fd_set master_set;
     unordered_set<int> client_fds;
+    IClientHandler* handler;
 
   private:
     void setup_socket();
@@ -69,8 +94,13 @@ class TcpServer
     void close_client(int client_fd);
 };
 
-TcpServer::TcpServer(int port) : port(port), server_fd(-1), max_fd(0)
+TcpServer::TcpServer(int port, IClientHandler* handler) :
+  port(port), server_fd(-1), max_fd(0), handler(handler)
 {
+  if(handler == nullptr)
+  {
+    throw std::invalid_argument("Client handler cannot be null");
+  }
   setup_socket();
 }
 
@@ -89,6 +119,7 @@ void TcpServer::run()
   {
     fd_set read_set = master_set;
     int nfreadyfds = select(max_fd + 1, &read_set, NULL, NULL, NULL);
+
     if(nfreadyfds < 0)
     {
       perror("select");
@@ -112,25 +143,6 @@ void TcpServer::run()
   }
 }
 
-void TcpServer::on_client_data(int client_fd, const char *data, ssize_t len)
-{
-  auto nfbytes = send(client_fd, data, len, 0);
-  if(nfbytes <= 0)
-  {
-    perror("send");
-  }
-}
-
-void TcpServer::on_client_connect(int client_fd)
-{
-  std::cout << "Client connected: FD=" << client_fd << "\n";
-}
-
-void TcpServer::on_client_disconnect(int client_fd)
-{
-  std::cout << "Client disconnected: FD=" << client_fd << "\n";
-}
-
 void TcpServer::setup_socket()
 {
   server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -148,7 +160,7 @@ void TcpServer::setup_socket()
   sockaddr_in address;
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
-  address.sin_addr.s_addr = INADDR_ANY;
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
 
   if(bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
   {
@@ -184,7 +196,7 @@ void TcpServer::accept_new_client()
     max_fd = client_fd;
   }
 
-  on_client_connect(client_fd);
+  handler->on_client_connect(client_fd);
 }
 
 void TcpServer::handle_existing_client(int client_fd)
@@ -193,12 +205,12 @@ void TcpServer::handle_existing_client(int client_fd)
   auto nfbytes = recv(client_fd, buffer, sizeof(buffer), 0);
   if(nfbytes <= 0)
   {
-    on_client_connect(client_fd);
+    handler->on_client_disconnect(client_fd);
     close_client(client_fd);
   }
   else
   {
-    on_client_data(client_fd, buffer, nfbytes);
+    handler->on_client_data(client_fd, buffer, nfbytes);
   }
 }
 
@@ -207,36 +219,109 @@ void TcpServer::close_client(int client_fd)
   close(client_fd);
   FD_CLR(client_fd, &master_set);
   client_fds.erase(client_fd);
-  on_client_disconnect(client_fd);
 }
 
-class EchoServer : public TcpServer
+// Echo chat server
+class EchoHandler : public IClientHandler
 {
   public:
-  /* It tells the compiler to inherit all constructors from the
-  base class TcpServer into the derived class EchoServer.
-  Without this line, even though EchoServer inherits from TcpServer,
-  its constructors are not automatically inherited — meaning you'd have
-  to manually define constructors in EchoServer that call the corresponding
-  TcpServer constructors. */
-    using TcpServer::TcpServer;
-
-  protected:
     void on_client_data(int client_fd, const char* data, ssize_t len) override;
+    void on_client_connect(int client_fd) override;
+    void on_client_disconnect(int client_fd) override;
 };
 
-void EchoServer::on_client_data(int client_fd, const char* data, ssize_t len)
+void EchoHandler::on_client_data(int client_fd, const char* data, ssize_t len)
 {
   std::string msg(data, len);
   std::cout << "Client " << client_fd << ": " << msg;
-  TcpServer::on_client_data(client_fd, data, len);
+  send(client_fd, data, len, 0);
+}
+
+void EchoHandler::on_client_connect(int client_fd)
+{
+  std::cout << "Client connected: FD = " << client_fd << "\n";
+}
+
+void EchoHandler::on_client_disconnect(int client_fd)
+{
+  std::cout << "Client disconnected: FD = " << client_fd<< "\n";
+}
+
+// BroadCast chat handler class
+class BroadCastChatHandler: public IClientHandler
+{
+  public:
+    void on_client_data(int client_fd, const char* data, ssize_t len) override;
+    void on_client_connect(int client_fd) override;
+    void on_client_disconnect(int client_fd) override;
+
+  private:
+    std::unordered_set<int> clients;
+    std::mutex _mutex;
+    void broadcast(int sender_fd, const std::string& msg);
+};
+
+void BroadCastChatHandler::on_client_connect(int client_fd)
+{
+  std::lock_guard<std::mutex> lk(_mutex);
+  clients.insert(client_fd);
+  const std::string& msg =
+    "Client " + std::to_string(client_fd) + " joined the chat\n";
+  broadcast(client_fd, msg);
+  std::cout << msg;
+}
+
+void BroadCastChatHandler::on_client_data(
+  int client_fd, const char* data, ssize_t len)
+{
+  std::lock_guard<std::mutex> lk(_mutex);
+  const std::string& msg =
+    "Client " + std::to_string(client_fd) + ": " + std::string(data, len);
+  broadcast(client_fd, msg);
+  std::cout << msg;
+}
+
+void BroadCastChatHandler::on_client_disconnect(int client_fd)
+{
+  std::lock_guard<std::mutex> lk(_mutex);
+  clients.erase(client_fd);
+  const std::string& msg =
+    "Client " + std::to_string(client_fd) + " left the chat\n";
+  broadcast(client_fd, msg);
+  cout << msg;
+}
+
+void BroadCastChatHandler::broadcast(int sender_fd, const std::string &msg)
+{
+  for(auto const fd: clients)
+  {
+    if(fd != sender_fd)
+    {
+      send(fd, msg.c_str(), msg.length(), 0);
+    }
+  }
 }
 
 int main()
 {
+/*
   try
   {
-    EchoServer server(9000);
+    EchoHandler handler;
+    TcpServer server(9000, &handler);
+    server.run();
+  }
+  catch(const std::exception& e)
+  {
+    std::cerr << "Server error: " << e.what() << "\n";
+    return EXIT_FAILURE;
+  }
+ */
+
+  try
+  {
+    BroadCastChatHandler handler;
+    TcpServer server(9000, &handler);
     server.run();
   }
   catch(const std::exception& e)
