@@ -257,6 +257,7 @@ class BroadCastChatHandler: public IClientHandler
 
   private:
     std::unordered_set<int> clients;
+    std::unordered_map<int, std::string> nick_names;
     std::mutex _mutex;
     void broadcast(int sender_fd, const std::string& msg);
 };
@@ -265,28 +266,50 @@ void BroadCastChatHandler::on_client_connect(int client_fd)
 {
   std::lock_guard<std::mutex> lk(_mutex);
   clients.insert(client_fd);
-  const std::string& msg =
-    "Client " + std::to_string(client_fd) + " joined the chat\n";
-  broadcast(client_fd, msg);
+
+  const std::string& msg = " Enter your nickname: ";
   std::cout << msg;
+
+  send(client_fd, msg.c_str(), msg.length(), 0);
 }
 
 void BroadCastChatHandler::on_client_data(
   int client_fd, const char* data, ssize_t len)
 {
   std::lock_guard<std::mutex> lk(_mutex);
-  const std::string& msg =
-    "Client " + std::to_string(client_fd) + ": " + std::string(data, len);
-  broadcast(client_fd, msg);
-  std::cout << msg;
+  std::string msg(data, len);
+
+  msg.erase(std::remove(msg.begin(), msg.end(), '\r'), msg.end());
+  msg.erase(std::remove(msg.begin(), msg.end(), '\n'), msg.end());
+
+  // check if nickname already set.
+  if(nick_names.find(client_fd) == nick_names.end())
+  {
+    nick_names[client_fd] = msg;
+    const std::string& join_msg = msg + " joined the chat\n";
+    broadcast(client_fd, join_msg);
+    cout << join_msg;
+    return;
+  }
+
+  // normal message
+  const std::string& full_msg = nick_names[client_fd] + ": " + msg + "\n";
+  broadcast(client_fd, full_msg);
+  std::cout << full_msg;
 }
 
 void BroadCastChatHandler::on_client_disconnect(int client_fd)
 {
   std::lock_guard<std::mutex> lk(_mutex);
+
+  const std::string& name =
+    nick_names.count(client_fd) ? nick_names[client_fd] :
+      "Client " + std::to_string(client_fd);
+
   clients.erase(client_fd);
-  const std::string& msg =
-    "Client " + std::to_string(client_fd) + " left the chat\n";
+  nick_names.erase(client_fd);
+
+  std::string msg = name + " left the chat\n";
   broadcast(client_fd, msg);
   cout << msg;
 }
